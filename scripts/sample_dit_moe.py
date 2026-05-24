@@ -3,13 +3,11 @@
 import argparse
 from pathlib import Path
 
+from _bootstrap import bootstrap_repo_src
+
+bootstrap_repo_src()
+
 import torch
-
-REPO_SRC = Path(__file__).resolve().parents[1] / "src"
-import sys
-
-if str(REPO_SRC) not in sys.path:
-    sys.path.insert(0, str(REPO_SRC))
 
 from diffusers.pipelines.dit_moe import DiTMoEPipeline
 

@@ -2,27 +2,32 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from __future__ import annotations
-
+import importlib
 import inspect
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from ..._hf_diffusers import get_hf_attr
-from ...models.transformers.transformer_dit_moe import DiTMoETransformer2DModel
-from ...schedulers.scheduling_flow_match_dit_moe import DiTMoEFlowMatchScheduler
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
+from diffusers.schedulers import DDIMScheduler, KarrasDiffusionSchedulers
+from diffusers.utils import replace_example_docstring
+from diffusers.utils.torch_utils import randn_tensor
 
-VaeImageProcessor = get_hf_attr("diffusers.image_processor.VaeImageProcessor")
-DiffusionPipeline = get_hf_attr("diffusers.pipelines.pipeline_utils.DiffusionPipeline")
-ImagePipelineOutput = get_hf_attr("diffusers.pipelines.pipeline_utils.ImagePipelineOutput")
-DDIMScheduler = get_hf_attr("diffusers.schedulers.DDIMScheduler")
-KarrasDiffusionSchedulers = get_hf_attr("diffusers.schedulers.KarrasDiffusionSchedulers")
-replace_example_docstring = get_hf_attr("diffusers.utils.replace_example_docstring")
-randn_tensor = get_hf_attr("diffusers.utils.torch_utils.randn_tensor")
+DEFAULT_NATIVE_RESOLUTION = 256
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -72,8 +77,8 @@ class DiTMoEPipeline(DiffusionPipeline):
 
     def __init__(
         self,
-        transformer: DiTMoETransformer2DModel,
-        scheduler: Union[DDIMScheduler, DiTMoEFlowMatchScheduler],
+        transformer,
+        scheduler: KarrasDiffusionSchedulers,
         vae=None,
         id2label: Optional[Dict[Union[int, str], str]] = None,
         null_class_id: Optional[int] = None,
@@ -81,7 +86,7 @@ class DiTMoEPipeline(DiffusionPipeline):
         super().__init__()
         self.register_modules(transformer=transformer, scheduler=scheduler, vae=vae)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-        self._use_rectified_flow = isinstance(scheduler, DiTMoEFlowMatchScheduler)
+        self._use_rectified_flow = scheduler.__class__.__name__ == "DiTMoEFlowMatchScheduler"
 
         if null_class_id is None:
             null_class_id = int(getattr(self.transformer.config, "num_classes", 1000))
@@ -100,59 +105,88 @@ class DiTMoEPipeline(DiffusionPipeline):
         return 8
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        model_kwargs = dict(kwargs)
-        id2label_override = model_kwargs.pop("id2label", None)
-        null_class_id_override = model_kwargs.pop("null_class_id", None)
-        transformer_subfolder = model_kwargs.pop("transformer_subfolder", None)
-        scheduler_subfolder = model_kwargs.pop("scheduler_subfolder", None)
-        vae_subfolder = model_kwargs.pop("vae_subfolder", None)
-        base_path = Path(pretrained_model_name_or_path)
+    def from_pretrained(cls, pretrained_model_name_or_path=None, subfolder=None, **kwargs):
+        r"""Load a self-contained variant folder locally or from the Hub."""
+        repo_root = Path(__file__).resolve().parent
 
-        if transformer_subfolder is None and (base_path / "transformer").exists():
-            transformer_subfolder = "transformer"
-        if scheduler_subfolder is None and (base_path / "scheduler").exists():
-            scheduler_subfolder = "scheduler"
-        if vae_subfolder is None and (base_path / "vae").exists():
-            vae_subfolder = "vae"
+        if pretrained_model_name_or_path in (None, "", "."):
+            variant = repo_root
+        elif (
+            isinstance(pretrained_model_name_or_path, str)
+            and "/" in pretrained_model_name_or_path
+            and not Path(pretrained_model_name_or_path).exists()
+        ):
+            from huggingface_hub import snapshot_download
+
+            hub_kwargs = dict(kwargs.pop("hub_kwargs", {}))
+            if subfolder:
+                hub_kwargs.setdefault("allow_patterns", [f"{subfolder}/**"])
+            cache_dir = snapshot_download(pretrained_model_name_or_path, **hub_kwargs)
+            variant = Path(cache_dir) / subfolder if subfolder else Path(cache_dir)
+        else:
+            variant = Path(pretrained_model_name_or_path)
+            if not variant.is_absolute():
+                candidate = (Path.cwd() / variant).resolve()
+                variant = candidate if candidate.exists() else (repo_root / variant).resolve()
+            if subfolder:
+                variant = variant / subfolder
+
+        id2label_override = kwargs.pop("id2label", None)
+        null_class_id_override = kwargs.pop("null_class_id", None)
+        model_kwargs = dict(kwargs)
+        inserted: List[str] = []
+
+        def _load_component(folder: str, module_name: str, class_name: str):
+            comp_dir = variant / folder
+            module_path = comp_dir / f"{module_name}.py"
+            has_weights = (comp_dir / "config.json").exists() or (comp_dir / "scheduler_config.json").exists()
+            if not module_path.exists() or not has_weights:
+                return None
+
+            comp_path = str(comp_dir)
+            if comp_path not in sys.path:
+                sys.path.insert(0, comp_path)
+                inserted.append(comp_path)
+
+            module = importlib.import_module(module_name)
+            component_cls = getattr(module, class_name)
+            return component_cls.from_pretrained(str(comp_dir), **model_kwargs)
 
         try:
-            return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-        except Exception:
-            transformer_path = (
-                str(base_path / transformer_subfolder) if transformer_subfolder else pretrained_model_name_or_path
-            )
-            transformer = DiTMoETransformer2DModel.from_pretrained(transformer_path, **model_kwargs)
+            transformer = _load_component("transformer", "transformer_dit_moe", "DiTMoETransformer2DModel")
+            if transformer is None:
+                raise ValueError(f"No loadable transformer found under {variant}")
 
             scheduler = None
-            scheduler_config_path = base_path / (scheduler_subfolder or "scheduler") / "scheduler_config.json"
+            scheduler_config_path = variant / "scheduler" / "scheduler_config.json"
+            scheduler_dir = variant / "scheduler"
             if scheduler_config_path.exists():
                 scheduler_config = json.loads(scheduler_config_path.read_text(encoding="utf-8"))
-                if scheduler_config.get("_class_name") == "DiTMoEFlowMatchScheduler":
-                    scheduler = DiTMoEFlowMatchScheduler.from_pretrained(
-                        pretrained_model_name_or_path,
-                        subfolder=scheduler_subfolder or "scheduler",
-                    )
+                scheduler_class = scheduler_config.get("_class_name", "DDIMScheduler")
+                if scheduler_class == "DiTMoEFlowMatchScheduler":
+                    scheduler_path = str(scheduler_dir)
+                    if scheduler_path not in sys.path:
+                        sys.path.insert(0, scheduler_path)
+                        inserted.append(scheduler_path)
+                    scheduler_module = importlib.import_module("scheduling_flow_match_dit_moe")
+                    scheduler_cls = getattr(scheduler_module, "DiTMoEFlowMatchScheduler")
+                    scheduler = scheduler_cls.from_pretrained(str(variant), subfolder="scheduler")
                 else:
-                    scheduler = DDIMScheduler.from_pretrained(
-                        pretrained_model_name_or_path,
-                        subfolder=scheduler_subfolder or "scheduler",
-                    )
+                    scheduler = DDIMScheduler.from_pretrained(str(variant), subfolder="scheduler")
             if scheduler is None:
                 scheduler = DDIMScheduler(num_train_timesteps=1000)
 
             vae = None
-            if vae_subfolder is not None:
-                try:
-                    autoencoder_kl = get_hf_attr("diffusers.AutoencoderKL")
-                    vae = autoencoder_kl.from_pretrained(str(base_path / vae_subfolder), **model_kwargs)
-                except Exception:
-                    vae = None
+            vae_dir = variant / "vae"
+            if vae_dir.exists() and (vae_dir / "config.json").exists():
+                from diffusers import AutoencoderKL
 
-            pipeline_config = cls._read_pipeline_config_from_model_index(str(base_path))
+                vae = AutoencoderKL.from_pretrained(str(vae_dir), **model_kwargs)
+
+            pipeline_config = cls._read_pipeline_config_from_model_index(str(variant))
             id2label = id2label_override or pipeline_config.get("id2label")
-            null_class_id = (
-                null_class_id_override if null_class_id_override is not None else pipeline_config.get("null_class_id")
+            null_class_id = null_class_id_override if null_class_id_override is not None else pipeline_config.get(
+                "null_class_id"
             )
             pipe = cls(
                 transformer=transformer,
@@ -162,8 +196,12 @@ class DiTMoEPipeline(DiffusionPipeline):
                 null_class_id=null_class_id,
             )
             if hasattr(pipe, "register_to_config"):
-                pipe.register_to_config(_name_or_path=str(base_path))
+                pipe.register_to_config(_name_or_path=str(variant))
             return pipe
+        finally:
+            for comp_path in inserted:
+                if comp_path in sys.path:
+                    sys.path.remove(comp_path)
 
     @staticmethod
     def _normalize_id2label(id2label: Optional[Dict[Union[int, str], str]]) -> Dict[int, str]:

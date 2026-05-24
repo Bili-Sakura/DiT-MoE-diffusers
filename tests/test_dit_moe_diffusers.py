@@ -5,11 +5,13 @@ torch = pytest.importorskip("torch")
 import sys
 from pathlib import Path
 
-REPO_SRC = Path(__file__).resolve().parents[1] / "src"
-if str(REPO_SRC) not in sys.path:
-    sys.path.insert(0, str(REPO_SRC))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from _bootstrap import bootstrap_repo_src
+
+bootstrap_repo_src()
 
 from diffusers.models.transformers.transformer_dit_moe import DiTMoETransformer2DModel
+from diffusers.pipelines.dit_moe import DiTMoEPipeline
 from diffusers.schedulers.scheduling_flow_match_dit_moe import DiTMoEFlowMatchScheduler
 
 
@@ -58,3 +60,26 @@ def test_scheduler_sde_final_step_is_deterministic():
     )
 
     assert output.prev_sample.shape == sample.shape
+
+
+def test_pipeline_id2label_helpers():
+    transformer = DiTMoETransformer2DModel(
+        input_size=8,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=64,
+        depth=2,
+        num_heads=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        learn_sigma=False,
+    )
+    scheduler = DiTMoEFlowMatchScheduler(mode="ode")
+    id2label = {207: "golden retriever", 360: "otter"}
+    pipe = DiTMoEPipeline(transformer=transformer, scheduler=scheduler, id2label=id2label)
+
+    assert pipe.id2label[207] == "golden retriever"
+    assert pipe.get_label_ids("golden retriever") == [207]
+    assert pipe.get_label_ids(["golden retriever", "otter"]) == [207, 360]
+    assert pipe._normalize_class_labels("golden retriever") == [207]
+    assert pipe.config.null_class_id == 1000

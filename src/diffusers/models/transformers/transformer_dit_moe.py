@@ -110,7 +110,8 @@ class DiTMoETimestepEmbedder(nn.Module):
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(timesteps, self.frequency_embedding_size)
-        return self.mlp(t_freq)
+        weight_dtype = self.mlp[0].weight.dtype
+        return self.mlp(t_freq.to(dtype=weight_dtype))
 
 
 class DiTMoELabelEmbedder(nn.Module):
