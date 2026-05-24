@@ -34,6 +34,8 @@ python scripts/convert_dit_moe_to_diffusers.py \
 
 Use `--copy-vae /path/to/sd-vae-ft-mse` to vendor a local VAE into `output/vae`, or rely on `vae_pretrained_model_name_or_path.txt` for Hub download at sample time.
 
+Use `--torch-dtype float32` for full-precision debugging; `bfloat16` is the default in `sample_dit_moe.py`.
+
 ### Sample
 
 ```bash
@@ -42,8 +44,7 @@ python scripts/sample_dit_moe.py \
   --class-label 207 360 387 974 \
   --image-size 256 \
   --num-inference-steps 50 \
-  --guidance-scale 4.0 \
-  --torch-dtype float16
+  --guidance-scale 4.0
 ```
 
 ### Pre-trained weights

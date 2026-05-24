@@ -195,6 +195,7 @@ Each variant keeps an English `id2label` map in `model_index.json` (DiT-style).
 | Sampler | {sampler} |
 | Steps | 50 |
 | CFG scale | 4.0 |
+| Dtype | `bfloat16` (recommended on Ampere+) |
 | VAE | `stabilityai/sd-vae-ft-mse` (bundled under `vae/`) |
 
 ```python
@@ -208,7 +209,7 @@ pipe = DiffusionPipeline.from_pretrained(
     local_files_only=True,
     custom_pipeline=str(model_dir / "pipeline.py"),
     trust_remote_code=True,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
 )
 pipe.to("cuda")
 

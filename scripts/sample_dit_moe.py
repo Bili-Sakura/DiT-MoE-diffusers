@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=256, choices=[256, 512])
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=4.0)
-    parser.add_argument("--torch-dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument("--torch-dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", default="samples")
