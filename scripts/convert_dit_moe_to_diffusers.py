@@ -62,13 +62,23 @@ RF_SCHEDULER_CONFIG = {
 }
 
 
-def _load_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+def _resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; pass --device cpu.")
+    return resolved
+
+
+def _load_state_dict(checkpoint_path: str, device: torch.device) -> Dict[str, torch.Tensor]:
+    map_location = device
     if checkpoint_path.endswith(".safetensors"):
         if safe_load_file is None:
             raise ImportError("Install safetensors to convert .safetensors checkpoints.")
-        state_dict = safe_load_file(checkpoint_path, device="cpu")
+        state_dict = safe_load_file(checkpoint_path, device=str(map_location))
     else:
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
         if isinstance(state_dict, dict):
             for key in ("state_dict", "model", "module", "ema"):
                 if key in state_dict and isinstance(state_dict[key], dict):
@@ -94,6 +104,10 @@ def infer_learn_sigma(state_dict: Dict[str, torch.Tensor], patch_size: int, in_c
         return True
     base = patch_size * patch_size * in_channels
     return int(weight.shape[0]) == base * 2
+
+
+def infer_use_flash_attn(state_dict: Dict[str, torch.Tensor]) -> bool:
+    return any(key.endswith("attn.Wqkv.weight") for key in state_dict)
 
 
 def load_imagenet_id2label() -> Dict[int, str]:
@@ -152,8 +166,9 @@ def _write_model_index(
         handle.write("\n")
 
 
-def _write_readme(output_dir: Path, *, variant_name: str, model: str, rectified_flow: bool, image_size: int):
+def _write_readme(output_dir: Path, *, variant_name: str, model: str, rectified_flow: bool, image_size: int, use_flash_attn: bool = False):
     sampler = "rectified-flow (DiTMoEFlowMatchScheduler)" if rectified_flow else "DDIM"
+    flash_attn_note = "\n| Flash attention | `pip install flash-attn` required for XL/G |\n" if use_flash_attn else ""
     content = f"""---
 license: apache-2.0
 library_name: diffusers
@@ -196,7 +211,7 @@ Each variant keeps an English `id2label` map in `model_index.json` (DiT-style).
 | Steps | 50 |
 | CFG scale | 4.0 |
 | Dtype | `bfloat16` (recommended on Ampere+) |
-| VAE | `stabilityai/sd-vae-ft-mse` (bundled under `vae/`) |
+{flash_attn_note}| VAE | `stabilityai/sd-vae-ft-mse` (bundled under `vae/`) |
 
 ```python
 from pathlib import Path
@@ -231,7 +246,15 @@ image.save("demo.png")
     (output_dir / "README.md").write_text(content, encoding="utf-8")
 
 
-def make_self_contained_repo(output_dir: Path, *, rectified_flow: bool, variant_name: str, model: str, image_size: int):
+def make_self_contained_repo(
+    output_dir: Path,
+    *,
+    rectified_flow: bool,
+    variant_name: str,
+    model: str,
+    image_size: int,
+    use_flash_attn: bool = False,
+):
     shutil.copy2(REPO_ROOT / "templates/pipeline.py", output_dir / "pipeline.py")
     shutil.copy2(
         REPO_ROOT / "src/diffusers/models/transformers/transformer_dit_moe.py",
@@ -263,6 +286,7 @@ def make_self_contained_repo(output_dir: Path, *, rectified_flow: bool, variant_
         model=model,
         rectified_flow=rectified_flow,
         image_size=image_size,
+        use_flash_attn=use_flash_attn,
     )
 
 
@@ -275,26 +299,37 @@ def parse_args():
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--num-experts-per-tok", type=int, default=2)
     parser.add_argument("--pretraining-tp", type=int, default=2)
-    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use-flash-attn", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rectified-flow", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learn-sigma", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--vae", default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--copy-vae", default=None, help="Optional local VAE directory to copy into output/vae.")
     parser.add_argument("--safe-serialization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--check-load", action="store_true")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Device for checkpoint load and --check-load (default: cuda when available).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    device = _resolve_device(args.device)
     output_dir = Path(args.output)
     transformer_dir = output_dir / "transformer"
     scheduler_dir = output_dir / "scheduler"
 
     latent_size = args.image_size // 8
-    state_dict = _load_state_dict(args.checkpoint)
+    print(f"Loading checkpoint on {device}...")
+    state_dict = _load_state_dict(args.checkpoint, device)
     preset = MODEL_PRESETS[args.model]
     learn_sigma = infer_learn_sigma(state_dict, patch_size=preset["patch_size"]) if args.learn_sigma is None else args.learn_sigma
+    use_flash_attn = infer_use_flash_attn(state_dict) if args.use_flash_attn is None else args.use_flash_attn
+    if use_flash_attn:
+        print("Detected flash-attention checkpoint layout (Wqkv/out_proj).")
     config = {
         "input_size": latent_size,
         "in_channels": 4,
@@ -303,21 +338,37 @@ def main():
         "num_experts": args.num_experts,
         "num_experts_per_tok": args.num_experts_per_tok,
         "pretraining_tp": args.pretraining_tp,
-        "use_flash_attn": args.use_flash_attn,
+        "use_flash_attn": use_flash_attn,
         "learn_sigma": learn_sigma,
         **preset,
     }
 
     if args.check_load:
-        model = DiTMoETransformer2DModel(**config)
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if missing_keys or unexpected_keys:
-            print("Missing keys:", missing_keys)
-            print("Unexpected keys:", unexpected_keys)
-            raise SystemExit(1)
+        print(f"Verifying weight load on {device}...")
+        try:
+            model = DiTMoETransformer2DModel(**config).to(device)
+        except ImportError as error:
+            if use_flash_attn:
+                print(f"Skipping --check-load: {error}")
+            else:
+                raise
+        else:
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if missing_keys or unexpected_keys:
+                print("Missing keys:", missing_keys)
+                print("Unexpected keys:", unexpected_keys)
+                raise SystemExit(1)
+
+    save_state_dict = {key: value.detach().cpu() for key, value in state_dict.items()}
+    del state_dict
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     _save_config(transformer_dir, {"_class_name": "DiTMoETransformer2DModel", **config})
-    _save_weights(transformer_dir, state_dict, args.safe_serialization)
+    _save_weights(transformer_dir, save_state_dict, args.safe_serialization)
 
     scheduler_config = RF_SCHEDULER_CONFIG if args.rectified_flow else DDIM_SCHEDULER_CONFIG
     _save_config(scheduler_dir, scheduler_config, filename="scheduler_config.json")
@@ -335,6 +386,7 @@ def main():
         variant_name=variant_name,
         model=args.model,
         image_size=args.image_size,
+        use_flash_attn=use_flash_attn,
     )
     print(f"Saved Diffusers-style DiT-MoE pipeline to {output_dir}")
 
